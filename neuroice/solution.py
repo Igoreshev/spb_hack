@@ -5,9 +5,7 @@ import pandas as pd
 from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import RobustScaler
-from sklearn.svm import OneClassSVM
 
 FEATURE_SIZE = 42
 
@@ -31,22 +29,6 @@ def _anomaly_score(model, X: np.ndarray) -> np.ndarray:
         return scores
     except Exception:
         return np.zeros(X.shape[0])
-
-
-def _sanitize_weights(weights, n_models: int) -> np.ndarray:
-    if n_models <= 0:
-        return np.zeros(0, dtype=np.float32)
-
-    arr = np.asarray(weights if weights is not None else [], dtype=np.float32)
-    if arr.shape[0] != n_models:
-        return np.full(n_models, 1.0 / n_models, dtype=np.float32)
-
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    total = float(np.sum(arr))
-    if total <= 1e-9:
-        return np.full(n_models, 1.0 / n_models, dtype=np.float32)
-
-    return (arr / total).astype(np.float32)
 
 
 def _extract_features_from_audio(wav_path: Path) -> np.ndarray:
@@ -114,8 +96,7 @@ class PredictionModel:
         fallback_model_path = base_path / "model.pkl"
         scaler_path = base_path / "scaler.pkl"
 
-        self.models = []
-        self.weights = []
+        self.model = None
         self.scaler = None
         self.pca = None
         self.score_center = 0.0
@@ -124,14 +105,15 @@ class PredictionModel:
         model_path = best_model_path if best_model_path.exists() else fallback_model_path
         if model_path.exists():
             model_obj = joblib.load(model_path)
-            if isinstance(model_obj, dict) and "models" in model_obj:
-                self.models = model_obj["models"]
-                self.weights = _sanitize_weights(model_obj.get("weights"), len(self.models)).tolist()
+            if isinstance(model_obj, dict):
+                if "model" in model_obj:
+                    self.model = model_obj["model"]
+                elif "models" in model_obj and len(model_obj["models"]) > 0:
+                    self.model = model_obj["models"][0]
             else:
-                self.models = [model_obj]
-                self.weights = [1.0]
+                self.model = model_obj
         else:
-            self.models = []
+            self.model = None
             print("WARNING: best_model.pkl or model.pkl not found!")
 
         if scaler_path.exists():
@@ -150,17 +132,13 @@ class PredictionModel:
     def _extract_features(self, wav_path: Path) -> np.ndarray:
         return _extract_features_from_audio(wav_path)
 
-    def _combine_scores(self, X: np.ndarray) -> np.ndarray:
-        if len(self.models) == 0:
+    def _score(self, X: np.ndarray) -> np.ndarray:
+        if self.model is None:
             return np.zeros(X.shape[0], dtype=np.float32)
 
-        score_list = [ _anomaly_score(model, X) for model in self.models ]
-        stacked = np.vstack(score_list).T
-        weights = _sanitize_weights(self.weights, len(self.models))
-        combined = np.average(stacked, axis=1, weights=weights)
-        # Очистка NaN/inf
-        combined = np.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=0.0)
-        return combined.astype(np.float32)
+        scores = _anomaly_score(self.model, X)
+        scores = np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0)
+        return scores.astype(np.float32)
 
     def predict(self, batch: list[Path]) -> list[float]:
         if len(batch) == 0:
@@ -175,7 +153,7 @@ class PredictionModel:
         if self.pca is not None:
             X = self.pca.transform(X)
 
-        raw_scores = self._combine_scores(X)
+        raw_scores = self._score(X)
         normalized = (raw_scores - self.score_center) / (self.score_scale + 1e-9)
         # Очистка NaN/inf перед возвратом
         normalized = np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0)
@@ -208,19 +186,13 @@ def train_and_save(
         random_state=42,
         n_jobs=-1,
     )
-    lof = LocalOutlierFactor(n_neighbors=20, novelty=True)
-    ocsvm = OneClassSVM(kernel="rbf", gamma="scale", nu=max(0.02, contamination), shrinking=True)
-
-    for model in (iforest, lof, ocsvm):
-        model.fit(X_proj)
+    iforest.fit(X_proj)
 
     model_dict = {
-        "models": [iforest, lof, ocsvm],
-        "weights": _sanitize_weights([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], 3).tolist(),
+        "model": iforest,
     }
 
-    ensemble_scores = np.column_stack([_anomaly_score(model, X_proj) for model in model_dict["models"]])
-    score_vector = np.mean(ensemble_scores, axis=1)
+    score_vector = _anomaly_score(iforest, X_proj)
     score_scale = float(np.std(score_vector))
     if score_scale < 1e-6:
         score_scale = 1.0
